@@ -4,7 +4,7 @@ const express = require('express');
 const { nanoid } = require('nanoid'); // Assuming nanoid v3 for CommonJS
 
 // --- Configuration ---
-const ANONYMOUS_URL_LIMIT = 15; // Limit for anonymous users per IP
+const ANONYMOUS_URL_LIMIT = 20; // Limit for anonymous users per IP
 const TEMP_URL_EXPIRY_DAYS = 30; // Standard expiry for temp URLs
 const SHORT_URL_LENGTH = 8;
 

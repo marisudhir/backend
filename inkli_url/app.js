@@ -4,6 +4,9 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 require('dotenv').config();
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+const subscribersRoute = require('./subscribers');
 
 // --- Route Imports ---
 const authRoutes = require('./auth');
@@ -20,14 +23,22 @@ const port = process.env.PORT || 3000;
 // --- Configuration Constants ---
 const SECRET_KEY = process.env.JWT_SECRET;
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN;
+const EMAIL_SERVICE = process.env.EMAIL_SERVICE;
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_PASS = process.env.EMAIL_PASS;
 
 // --- Basic Checks ---
 if (!SECRET_KEY) {
-    console.error("FATAL ERROR: JWT_SECRET is not defined in .env file.");
+    console.error('FATAL ERROR: JWT_SECRET is not defined in .env file.');
     process.exit(1);
 }
 if (!FRONTEND_ORIGIN) {
-    console.warn("WARNING: FRONTEND_ORIGIN is not defined in .env file. CORS might block frontend requests.");
+    console.warn('WARNING: FRONTEND_ORIGIN is not defined in .env file. CORS might block frontend requests.');
+}
+if (!EMAIL_SERVICE || !EMAIL_USER || !EMAIL_PASS) {
+    console.warn(
+        'WARNING: Email configuration (EMAIL_SERVICE, EMAIL_USER, EMAIL_PASS) is not fully defined in .env file. Email verification will likely fail.'
+    );
 }
 
 // --- Database Configuration ---
@@ -44,7 +55,7 @@ const corsOptions = {
     origin: FRONTEND_ORIGIN,
     methods: 'POST, GET, DELETE, PUT, PATCH',
     allowedHeaders: 'Content-Type, Authorization',
-    credentials: true
+    credentials: true,
 };
 
 // --- Global Middleware ---
@@ -94,30 +105,46 @@ const authenticateToken = async (req, res, next) => {
 
 // --- Route Mounting ---
 
+// Configure nodemailer for email verification
+const emailConfig = {
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+    },
+};
+
 // Initialize blog routes
 const blogRouters = blogRoutes(client, jwt);
+
+// Initialize subscribers module
+const { router: subscribersRouter, notifySubscribers } = subscribersRoute(client, FRONTEND_ORIGIN, emailConfig);
 
 // Public routes
 app.use('/api/blogs', blogRouters.public);
 
-// Protected routes - Mount the /me route BEFORE the generic /:postId routes
+// Protected routes
 const protectedBlogRouter = express.Router();
 protectedBlogRouter.use(authenticateToken);
-protectedBlogRouter.use('/', (req, res, next) => {
-    // Log the incoming request to the protected blog routes for debugging
-    console.log(`Protected Blog Route Hit: ${req.method} ${req.originalUrl}`);
+
+// Make notifySubscribers available to blog routes
+protectedBlogRouter.use((req, res, next) => {
+    req.app.set('notifySubscribers', notifySubscribers);
     next();
 });
-protectedBlogRouter.get('/me', blogRouters.protected); // Mount /me specifically
-protectedBlogRouter.use('/', blogRouters.protected);    // Mount the rest of the protected routes
+
+// Mount /me route BEFORE the generic /:postId routes
+protectedBlogRouter.get('/me', blogRouters.protected);
+protectedBlogRouter.use('/', blogRouters.protected);
 app.use('/api/blogs', protectedBlogRouter);
 
-app.use('/api/auth', authRoutes(client, SECRET_KEY, bcrypt, jwt));
+app.use('/api/auth', authRoutes(client, SECRET_KEY, bcrypt, jwt, emailConfig, FRONTEND_ORIGIN));
 app.use('/api/public', publicUrlRoutes(client));
 app.use('/api/urls', authenticateToken, urlRoutes.protectedRouter(client, jwt, SECRET_KEY));
 app.use('/api/dashboard', authenticateToken, dashboardRoutes(client));
 app.post('/api/auth/logout', authenticateToken, logoutRoute(client));
 app.use('/api/user', authenticateToken, userProfileRoutes);
+app.use('/api/subscribe', subscribersRouter);
 
 // Public Redirect Route
 app.get('/:shortUrl', urlRoutes.redirect(client));
@@ -125,6 +152,14 @@ app.get('/:shortUrl', urlRoutes.redirect(client));
 // --- Error Handling Middleware ---
 app.use((req, res, next) => {
     res.status(404).json({ error: `Not Found - Cannot ${req.method} ${req.originalUrl}` });
+});
+
+// --- Health Check Route ---
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'OK',
+        timestamp: new Date().toISOString(),
+    });
 });
 
 app.use((err, req, res, next) => {
@@ -135,7 +170,8 @@ app.use((err, req, res, next) => {
 });
 
 // --- Database Connection and Initialization ---
-client.connect()
+client
+    .connect()
     .then(() => {
         console.log('Successfully connected to PostgreSQL database.');
         return createTables();
@@ -148,7 +184,7 @@ client.connect()
         setInterval(cleanupExpiredItems, 60 * 60 * 1000);
         cleanupExpiredItems();
     })
-    .catch(err => {
+    .catch((err) => {
         console.error('FATAL: Error connecting to or setting up PostgreSQL database:', err);
         process.exit(1);
     });
@@ -165,11 +201,15 @@ async function createTables() {
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 email VARCHAR(255) UNIQUE,
                 full_name VARCHAR(255),
-                bactive INTEGER DEFAULT 1
+                bactive INTEGER DEFAULT 0,
+                email_verified BOOLEAN DEFAULT FALSE,
+                verification_token TEXT,
+                verification_token_expiry TIMESTAMP WITH TIME ZONE
             );
         `);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_users_username ON users(LOWER(username));`);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(LOWER(email));`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_users_verification_token ON users(verification_token);`);
         console.log('-> Users table checked/created.');
 
         await client.query(`
@@ -233,12 +273,27 @@ async function createTables() {
                 user_id INTEGER REFERENCES users(id) ON DELETE CASCADE NOT NULL,
                 title VARCHAR(255) NOT NULL,
                 content TEXT NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                archived BOOLEAN DEFAULT FALSE
             );
         `);
         await client.query(`CREATE INDEX IF NOT EXISTS idx_blogposts_user_id ON blogposts(user_id);`);
         console.log('-> Blogposts table checked/created.');
 
+        // Create the subscriptions table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE NOT NULL,
+                email VARCHAR(255) NOT NULL,
+                active BOOLEAN DEFAULT TRUE,
+                subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (user_id, email)
+            );
+        `);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions (user_id);`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_subscriptions_email ON subscriptions (email);`);
+        console.log('-> Subscriptions table checked/created.');
     } catch (err) {
         console.error('Error during table creation:', err);
         throw err;
@@ -259,7 +314,9 @@ async function cleanupExpiredItems() {
         console.error(`[${new Date().toISOString()}] Error during periodic cleanup task:`, err);
     } finally {
         if (cleanedUrls > 0 || cleanedTokens > 0) {
-            console.log(`[${new Date().toISOString()}] Cleanup finished: Removed ${cleanedUrls} expired temp URLs and ${cleanedTokens} expired blacklist tokens.`);
+            console.log(
+                `[${new Date().toISOString()}] Cleanup finished: Removed ${cleanedUrls} expired temp URLs and ${cleanedTokens} expired blacklist tokens.`
+            );
         }
     }
 }

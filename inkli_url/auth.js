@@ -1,7 +1,9 @@
 // File: ./routes/auth.js
 
 const express = require('express');
-const router = express.Router(); // Create a new router instance
+const router = express.Router();
+const crypto = require('crypto'); // For generating verification tokens
+const nodemailer = require('nodemailer'); // For sending emails
 
 /**
  * Exports a function that configures authentication routes.
@@ -9,9 +11,14 @@ const router = express.Router(); // Create a new router instance
  * @param {string} secretKey - The JWT secret key.
  * @param {object} bcrypt - The bcrypt library instance.
  * @param {object} jwt - The jsonwebtoken library instance.
+ * @param {object} emailConfig - Configuration object for nodemailer. Example: { service: 'gmail', auth: { user: 'your_email@gmail.com', pass: 'your_password' } }
+ * @param {string} frontendUrl - The base URL of your frontend application (for the verification link).
  * @returns {object} The configured express router.
  */
-module.exports = (client, secretKey, bcrypt, jwt) => {
+module.exports = (client, secretKey, bcrypt, jwt, emailConfig, frontendUrl) => {
+
+    // --- Nodemailer Setup ---
+    const transporter = nodemailer.createTransport(emailConfig);
 
     // --- Registration Route ---
     // Path: POST /api/auth/register (relative to mount point in app.js)
@@ -43,22 +50,53 @@ module.exports = (client, secretKey, bcrypt, jwt) => {
         }
 
         try {
-            // --- Hash Password ---
-            // Use bcrypt to securely hash the password before storing
-            // 10 or 12 is the number of salt rounds - a good balance
-            const hashedPassword = await bcrypt.hash(password, 12);
-
-            // --- Store User in Database ---
-            // Use the passed-in 'client' for database operations
-            // Parameterized query ($1, $2, $3, $4, $5) prevents SQL injection
-            await client.query(
-                'INSERT INTO users (username, password, email, full_name, bactive) VALUES (LOWER($1), $2, LOWER($3), $4, $5)', // Store username and email lowercase, set bactive to 1
-                [username, hashedPassword, email, fullName, 1]
+            // --- Check if username or email already exists (before creating verification token) ---
+            const existingUser = await client.query(
+                'SELECT id FROM users WHERE LOWER(username) = LOWER($1) OR LOWER(email) = LOWER($2)',
+                [username, email]
             );
 
-            console.log(`User registered successfully: ${username} (${email})`);
-            // Send success response
-            res.status(201).json({ message: 'User registered successfully.' });
+            if (existingUser.rows.length > 0) {
+                if (existingUser.rows[0].username === username.toLowerCase()) {
+                    return res.status(400).json({ error: 'Username already exists. Please choose another.' });
+                } else if (existingUser.rows[0].email === email.toLowerCase()) {
+                    return res.status(400).json({ error: 'Email address already exists. Please use another.' });
+                }
+            }
+
+            // --- Generate Verification Token ---
+            const verificationToken = crypto.randomBytes(20).toString('hex');
+            const verificationTokenExpiry = new Date(Date.now() + 3600000); // Token expires in 1 hour
+
+            // --- Hash Password ---
+            const hashedPassword = await bcrypt.hash(password, 12);
+
+            // --- Store User in Database with Verification Token ---
+            await client.query(
+                'INSERT INTO users (username, password, email, full_name, bactive, email_verified, verification_token, verification_token_expiry) VALUES (LOWER($1), $2, LOWER($3), $4, $5, $6, $7, $8)',
+                [username, hashedPassword, email, fullName, 0, false, verificationToken, verificationTokenExpiry] // bactive is initially 0, email_verified is false
+            );
+
+            // --- Send Verification Email ---
+            const verificationLink = `${frontendUrl}/verify-email?token=${verificationToken}`;
+            const mailOptions = {
+                to: email,
+                subject: 'Verify Your Email Address',
+                html: `<p>Thank you for registering! Please click the following link to verify your email address:</p><p><a href="${verificationLink}">${verificationLink}</a></p><p>This link will expire in 1 hour.</p>`,
+            };
+
+            transporter.sendMail(mailOptions, (error, info) => {
+                if (error) {
+                    console.error('Error sending verification email:', error);
+                    // Optionally, you might want to delete the user from the database if email sending fails
+                    client.query('DELETE FROM users WHERE username = LOWER($1)', [username]).catch(dbErr => {
+                        console.error('Error deleting user after email failure:', dbErr);
+                    });
+                    return res.status(500).json({ error: 'Failed to send verification email. Please try again.' });
+                }
+                console.log('Verification email sent:', info.response);
+                res.status(201).json({ message: 'Registration successful. Please check your email to verify your account.' });
+            });
 
         } catch (err) {
             console.error(`Error registering user ${username} (${email}):`, err);
@@ -75,6 +113,53 @@ module.exports = (client, secretKey, bcrypt, jwt) => {
         }
     });
 
+    // --- Email Verification Route ---
+    // Path: GET /api/auth/verify-email
+    router.get('/verify-email', async (req, res) => {
+        const token = req.query.token;
+
+        if (!token) {
+            return res.status(400).json({ error: 'Verification token is missing.' });
+        }
+
+        try {
+            const result = await client.query(
+                'SELECT id, verification_token_expiry FROM users WHERE verification_token = $1',
+                [token]
+            );
+
+            if (result.rows.length === 0) {
+                return res.status(400).json({ error: 'Invalid verification token.' });
+            }
+
+            const user = result.rows[0];
+
+            if (new Date(user.verification_token_expiry) < new Date()) {
+                // Token has expired, you might want to allow the user to request a new verification email
+                await client.query(
+                    'UPDATE users SET verification_token = NULL, verification_token_expiry = NULL WHERE id = $1',
+                    [user.id]
+                );
+                return res.status(400).json({ error: 'Verification token has expired. Please request a new one.' });
+            }
+
+            // Update user to set email as verified and activate the account
+            await client.query(
+                'UPDATE users SET email_verified = true, bactive = true, verification_token = NULL, verification_token_expiry = NULL WHERE id = $1',
+                [user.id]
+            );
+
+            console.log(`Email verified successfully for user ID: ${user.id}`);
+            res.status(200).json({ message: 'Email verified successfully. You can now log in.' });
+            // Optionally, you can redirect the user to the login page on the frontend
+            // res.redirect(`${frontendUrl}/login?verification=success`);
+
+        } catch (err) {
+            console.error('Error verifying email:', err);
+            res.status(500).json({ error: 'Internal server error during email verification.' });
+        }
+    });
+
     // --- Login Route ---
     // Path: POST /api/auth/login (relative to mount point in app.js)
     router.post('/login', async (req, res) => {
@@ -88,9 +173,8 @@ module.exports = (client, secretKey, bcrypt, jwt) => {
 
         try {
             // --- Find User (case-insensitive) ---
-            // Query the database for the user by username (stored as lowercase)
             const result = await client.query(
-                'SELECT id, username, password FROM users WHERE username = LOWER($1)',
+                'SELECT id, username, password, email_verified, bactive FROM users WHERE username = LOWER($1)',
                 [username]
             );
 
@@ -103,8 +187,19 @@ module.exports = (client, secretKey, bcrypt, jwt) => {
 
             const user = result.rows[0]; // Get the user data
 
+            // --- Check if email is verified ---
+            if (!user.email_verified) {
+                console.log(`Login attempt failed: Email not verified for user - ${username} (${user.id})`);
+                return res.status(401).json({ error: 'Please verify your email address before logging in.' });
+            }
+
+            // --- Check if account is active ---
+            if (!user.bactive) {
+                console.log(`Login attempt failed: Account is inactive for user - ${username} (${user.id})`);
+                return res.status(403).json({ error: 'Your account is inactive. Please contact support.' });
+            }
+
             // --- Compare Passwords ---
-            // Use bcrypt.compare to check if the provided password matches the stored hash
             const isPasswordMatch = await bcrypt.compare(password, user.password);
 
             if (!isPasswordMatch) {
