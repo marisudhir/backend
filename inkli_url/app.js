@@ -16,7 +16,7 @@ const dashboardRoutes = require('./dashboard');
 const logoutRoute = require('./logout');
 const publicUrlRoutes = require('./publicUrls');
 const userProfileRoutes = require('./userprofile');
-
+const qrCodeRoute = require('./qr');
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -145,7 +145,7 @@ app.use('/api/dashboard', authenticateToken, dashboardRoutes(client));
 app.post('/api/auth/logout', authenticateToken, logoutRoute(client));
 app.use('/api/user', authenticateToken, userProfileRoutes);
 app.use('/api/subscribe', subscribersRouter);
-
+app.use('/api/qrcode', qrCodeRoute);
 // Public Redirect Route
 app.get('/:shortUrl', urlRoutes.redirect(client));
 
